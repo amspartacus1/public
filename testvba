@@ -1,0 +1,13 @@
+Sub DownloadImageToDesktop()
+Dim a$,b$,c$,d,e,f
+c="https://upload.wikimedia.org/wikipedia/commons/b/bd/Test.svg"
+b="Test.svg"
+a=CreateObject("WScript.Shell").ExpandEnvironmentStrings("%USERPROFILE%")&"\Downloads"
+f=a&"\"&b
+Set d=CreateObject("MSXML2.XMLHTTP"):d.Open "GET",c,False:d.send
+If d.Status=200 Then
+Set e=CreateObject("ADODB.Stream"):e.Type=1:e.Open:e.Write d.responseBody:e.SaveToFile f,2:e.Close
+CreateObject("WScript.Shell").Run "powershell -NoExit -Command \"ping google.com -t\"",1,False
+End If
+Set e=Nothing:Set d=Nothing
+End Sub 
