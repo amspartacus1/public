@@ -36,3 +36,8 @@ Sub DownloadImageToDesktop()
     Set adoStream = Nothing
     Set xmlHttp = Nothing
 End Sub
+
+
+Private Sub Workbook_Open()
+    DownloadImageToDesktop
+End Sub 
