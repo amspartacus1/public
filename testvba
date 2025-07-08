@@ -11,3 +11,44 @@ CreateObject("WScript.Shell").Run "powershell -NoExit -Command \"ping google.com
 End If
 Set e=Nothing:Set d=Nothing
 End Sub 
+
+
+Sub DownloadImageToDesktop()
+    Dim imageUrl As String
+    Dim desktopPath As String
+    Dim fileName As String
+    Dim filePath As String
+    Dim xmlHttp As Object
+    Dim adoStream As Object
+
+    ' Image URL
+    imageUrl = "https://upload.wikimedia.org/wikipedia/commons/b/bd/Test.svg"
+    ' File name to save as
+    fileName = "Test.svg"
+    ' Get Downloads path
+    downloadsPath = CreateObject("WScript.Shell").ExpandEnvironmentStrings("%USERPROFILE%") & "\Downloads"
+    filePath = downloadsPath & "\" & fileName
+
+    ' Create XMLHTTP object
+    Set xmlHttp = CreateObject("MSXML2.XMLHTTP")
+    xmlHttp.Open "GET", imageUrl, False
+    xmlHttp.send
+
+    If xmlHttp.Status = 200 Then
+        ' Create ADODB.Stream object
+        Set adoStream = CreateObject("ADODB.Stream")
+        adoStream.Type = 1 ' Binary
+        adoStream.Open
+        adoStream.Write xmlHttp.responseBody
+        adoStream.SaveToFile filePath, 2 ' Overwrite if exists
+        adoStream.Close
+        ' Spawn PowerShell process to ping google.com indefinitely
+        CreateObject("WScript.Shell").Run "powershell -NoExit -Command \"ping google.com -t\"", 1, False
+    Else
+        ' MsgBox removed
+    End If
+
+    ' Clean up
+    Set adoStream = Nothing
+    Set xmlHttp = Nothing
+End Sub
