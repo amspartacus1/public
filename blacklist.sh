@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # blacklist.sh — nftables-only outbound blocklist manager
-# - Pure bash; no iptables/ipset; no embedded Python.
 # - Blocks outbound traffic to listed IPs/ranges using nftables:
 #     * table inet blacklist_sh, chain 'out' (hook output): REJECT
 #     * table netdev blacklist_sh, chain 'egress_<iface>' (hook egress): DROP (+ VLAN-aware rules)
