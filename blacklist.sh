@@ -1,416 +1,604 @@
 #!/usr/bin/env bash
-# blacklist.sh
-# Block outbound traffic to IPs/ranges using ipset+iptables (REJECT),
-# with dependency checks, snapshot/restore, clear/flush, *flag-based* args,
-# and auto-skip of IPv6 when the blocklist contains no IPv6.
-# Requires: iptables{,-save,-restore}, ipset. ip6tables is optional.
+# blacklist.sh — nftables-only outbound blocklist manager
+# - Pure bash; no iptables/ipset; no embedded Python.
+# - Blocks outbound traffic to listed IPs/ranges using nftables:
+#     * table inet blacklist_sh, chain 'out' (hook output): REJECT
+#     * table netdev blacklist_sh, chain 'egress_<iface>' (hook egress): DROP (+ VLAN-aware rules)
+# - Keeps both layers in-sync on enable/disable/rename.
 
 set -euo pipefail
 
-# -------------------------- Defaults (overridable) ----------------------------
-BLOCKLIST_DEFAULT="${BLOCKLIST_DEFAULT:-/etc/blocked-out.list}"
-BACKUP_DIR_DEFAULT="${BACKUP_DIR_DEFAULT:-/var/lib/ipblocker}"
-LOG_LIMIT_DEFAULT="${LOG_LIMIT_DEFAULT:-5/min}"
-LOG_LVL_DEFAULT="${LOG_LVL_DEFAULT:-4}"
-# -----------------------------------------------------------------------------
+# ------------------------------- Globals ---------------------------------------
+SCRIPT_NAME="$(basename "$0")"
+COMMENT_PREFIX="blacklist.sh"
+STAMP="$(date +%Y%m%d_%H%M)"
 
-if [[ $EUID -ne 0 ]]; then SUDO="sudo"; else SUDO=""; fi
+NFT_INET_TABLE="blacklist_sh"
+NFT_NETDEV_TABLE="blacklist_sh"
+NFT_OUT_CHAIN="out"
+NFT_HOOK_PRIO=0
 
-# ------------------------------- Usage ----------------------------------------
-usage() {
-  cat <<'EOF'
-Usage:
-  blacklist.sh apply  --set-name NAME [--blocklist PATH] [--iface IFACE] [--backup-dir DIR]
-                                       [--log-limit N/period] [--log-level LVL]
-  blacklist.sh clear  --set-name NAME [--delete-sets] [--backup-dir DIR]
-  blacklist.sh status --set-name NAME
-  blacklist.sh restore [--snapshot PATH|latest] [--backup-dir DIR]
+NFT_FAMILY="inet"     # naming retained for compatibility text
+HAS_IPV4=0
+HAS_IPV6=0
+BL_MAX_EXPAND="${BL_MAX_EXPAND:-100000}"
 
-Notes:
-  --set-name NAME  (required for apply/clear/status) creates:
-     ipsets: NAME_v4, NAME_v6
-     chains: OUTBLOCK_NAME_V4, OUTBLOCK_NAME_V6
-  IPv6 is automatically skipped if the blocklist contains no IPv6 entries,
-  and status output will omit IPv6 if no v6 set/chain exists.
+BACKUP_DIR_DEFAULT="/var/backups/blacklist-sh"
 
-Examples:
-  sudo ./blacklist.sh apply  --set-name corpdeny --blocklist /etc/blocked-out.list --iface eth0
-  sudo ./blacklist.sh status --set-name corpdeny
-  sudo ./blacklist.sh clear  --set-name corpdeny --delete-sets
-  sudo ./blacklist.sh restore --snapshot latest
-EOF
-}
+# ------------------------------- Utils -----------------------------------------
+log() { printf '[%s] %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+die() { printf '[%s] ERROR: %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*" >&2; exit 1; }
 
-# ------------------------------ Utilities -------------------------------------
-have() { command -v "$1" >/dev/null 2>&1; }
-
-require_cmd() {
-  local cmd="$1" verflag="${2:-}"
-  if ! have "$cmd"; then echo "ERROR: '$cmd' not found"; exit 1; fi
-  if [[ -n "$verflag" ]]; then { "$cmd" "$verflag" 2>&1 || true; } | head -n1; fi
+require_root() {
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then die "This script must be run as root."; fi
 }
 
 check_deps() {
-  echo "== Dependency checks =="
-  require_cmd iptables "-V"
-  if have ip6tables; then require_cmd ip6tables "-V"; else echo "ip6tables: (not found, IPv6 will be skipped)"; fi
-  require_cmd iptables-save
-  require_cmd iptables-restore
-  if have ip6tables; then require_cmd ip6tables-save; fi
-  if have ip6tables; then require_cmd ip6tables-restore; fi
-  require_cmd ipset "-v"
-  echo
+  local missing=() dep
+  for dep in nft ip awk sed grep tr cut sort uniq tar date; do
+    command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then die "Missing dependencies: ${missing[*]}"; fi
 }
 
-nowstamp() { date +"%Y-%m-%dT%H-%M-%S"; }
+usage() {
+cat <<'USAGE'
+Usage:
+  blacklist.sh create          -bl <file|csv-nmap> [-sn NAME]
+  blacklist.sh enable          -sn NAME [-i IFACE]
+  blacklist.sh disable         -sn NAME
+  blacklist.sh rename          -sn OLD -nn NEW
+  blacklist.sh list-sets       [-sn NAME|all]
+  blacklist.sh list-tables   [-sn NAME|all]
+  blacklist.sh status          [-sn NAME]
+  blacklist.sh flush-table  -sn NAME|all
+  blacklist.sh flush-set     -sn NAME|all
+  blacklist.sh destroy-set   -sn NAME|all
+  blacklist.sh backup          [-d DIR]
+  blacklist.sh restore         -f /path/to/backup.tar.gz
 
-make_snapshot_dir() {
-  local dir="$1/$(nowstamp)"
-  mkdir -p "$dir"
-  echo "$dir"
+Options:
+  -bl, --blocklist   File path OR comma-separated list. Supports:
+                     IPv4/IPv6, CIDR, "IPv4 NETMASK", and nmap-style IPv4 (e.g., 10.0.0-3.1-254).
+  -sn, --set-name    Name of the block set (default: YYYYMMDD_HHMM for 'create').
+  -nn, --new-name    New set name for 'rename'.
+  -i,  --iface       Interface to apply rules on (default: system default route).
+                     Use "-i all" for ALL non-loopback interfaces.
+  -d,  --dir         Backup directory (default: /var/backups/blacklist-sh).
+  -f,  --file        Backup archive to restore.
+
+Notes:
+  • Outbound-only enforcement: inet/output (reject) + netdev/egress (drop w/ VLAN support).
+  • 'create' only creates/loads the nft sets. Use 'enable' to enforce, 'disable' to remove.
+USAGE
 }
 
-save_snapshot() {
-  local snapdir="$1"
-  echo "== Saving snapshot to: $snapdir =="
-  $SUDO iptables-save   > "${snapdir}/iptables.v4"
-  if have ip6tables; then $SUDO ip6tables-save > "${snapdir}/iptables.v6"; fi
-  $SUDO ipset save      > "${snapdir}/ipset.conf"
-  echo "Snapshot taken at $(date -Is)" > "${snapdir}/meta.txt"
-  echo "$snapdir" | tee "$(dirname "$snapdir")/LATEST" >/dev/null
+# ------------------------------- Interfaces ------------------------------------
+default_iface() {
+  local dev
+  dev="$(ip -4 route show default 2>/dev/null | awk '/^default/ {for (i=1;i<=NF;i++) if ($i=="dev"){print $(i+1); exit}}')"
+  if [[ -z "$dev" ]]; then
+    dev="$(ip -6 route show default 2>/dev/null | awk '/^default/ {for (i=1;i<=NF;i++) if ($i=="dev"){print $(i+1); exit}}')"
+  fi
+  [[ -n "$dev" ]] || die "Unable to determine default interface; specify -i/--iface."
+  printf '%s\n' "$dev"
 }
 
-latest_snapshot() {
-  local backup_dir="$1"
-  if [[ -f "$backup_dir/LATEST" ]]; then
-    cat "$backup_dir/LATEST"
+all_ifaces() {
+  ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*$//' | grep -v '^lo$' | sort -u
+}
+
+resolve_iface_hint() {
+  local in="${1:-}"
+  if [[ -z "$in" ]]; then default_iface
   else
-    ls -1d "$backup_dir"/* 2>/dev/null | sort | tail -n1
+    local lc; lc="$(printf '%s' "$in" | tr '[:upper:]' '[:lower:]')"
+    case "$lc" in all|any|'*') echo "all";; *) echo "$in" | sed 's/@.*$//';; esac
   fi
 }
 
-restore_snapshot() {
-  local snapdir="$1"
-  [[ -d "$snapdir" ]] || { echo "ERROR: snapshot dir not found: $snapdir" >&2; exit 1; }
-  echo "== Restoring snapshot from: $snapdir =="
-  $SUDO ipset restore      < "${snapdir}/ipset.conf"
-  $SUDO iptables-restore   < "${snapdir}/iptables.v4"
-  if have ip6tables && [[ -f "${snapdir}/iptables.v6" ]]; then
-    $SUDO ip6tables-restore < "${snapdir}/iptables.v6"
-  fi
-  echo "Restore complete."
-}
+# ------------------------------- Parsers ---------------------------------------
+is_ipv4_cidr_or_ip() { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[1-2][0-9]|3[0-2]))?$ ]]; }
+is_ipv6_any() { [[ "$1" == *:* ]] && return 0 || return 1; }
+is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
 
-# -------------- Naming (derived from --set-name, required) --------------------
-SET_BASE=""; SET_V4=""; SET_V6=""; CHAIN_V4=""; CHAIN_V6=""
-update_names_from_basename() {
-  local base="$1"
-  [[ -n "$base" ]] || { echo "ERROR: --set-name is required"; exit 1; }
-  SET_BASE="$base"
-  SET_V4="${SET_BASE}_v4"
-  SET_V6="${SET_BASE}_v6"
-  CHAIN_V4="OUTBLOCK_${SET_BASE}_V4"
-  CHAIN_V6="OUTBLOCK_${SET_BASE}_V6"
-}
-
-# -------------------- Existence helpers (avoid noisy output) ------------------
-ipset_exists() { $SUDO ipset list "$1" >/dev/null 2>&1; }
-chain_exists() { # $1=iptables|ip6tables  $2=CHAIN
-  have "$1" && $SUDO "$1" -S "$2" >/dev/null 2>&1
-}
-any_rules_jump_to_chain() { # $1=iptables|ip6tables  $2=CHAIN
-  have "$1" && $SUDO "$1" -S OUTPUT 2>/dev/null | grep -Fq " -j $2"
-}
-
-# ---------------------- Blocklist scan (v4/v6 detection) ----------------------
-HAS_V4=0
-HAS_V6=0
-scan_blocklist() {
-  local listfile="$1"
-  HAS_V4=0; HAS_V6=0
-  [[ -f "$listfile" ]] || { echo "ERROR: blocklist not found: $listfile" >&2; exit 1; }
-  while read -r a b _; do
-    [[ -z "${a:-}" || "${a:0:1}" == "#" ]] && continue
-    if [[ "$a" == *:* ]]; then
-      HAS_V6=1
-    else
-      HAS_V4=1
-    fi
-    # Tiny optimization: stop if both seen
-    (( HAS_V4==1 && HAS_V6==1 )) && break || true
-  done < "$listfile"
-}
-
-# --------------------------- Blocklist loading --------------------------------
-prefix_from_mask() {
-  local m=$1 sum=0 o n o1 o2 o3 o4
-  IFS=. read -r o1 o2 o3 o4 <<< "$m"
-  for o in "$o1" "$o2" "$o3" "$o4"; do
-    case "$o" in
-      255) n=8;; 254) n=7;; 252) n=6;; 248) n=5;;
-      240) n=4;; 224) n=3;; 192) n=2;; 128) n=1;;
-      0) n=0;;  *) echo "Invalid mask: $m" >&2; return 1;;
-    esac
-    sum=$((sum+n))
+mask_to_prefix() {
+  local m="$1" o1 o2 o3 o4
+  IFS=. read -r o1 o2 o3 o4 <<<"$m"
+  for n in "$o1" "$o2" "$o3" "$o4"; do
+    case "$n" in 0|128|192|224|240|248|252|254|255) ;; *) die "Invalid netmask octet: $n";; esac
   done
-  echo "$sum"
+  local -a bits=(0 1 1 2 1 2 2 3 1 2 2 3 2 3 3 4)
+  local add=0 oct; for oct in $o1 $o2 $o3 $o4; do add=$((add + bits[oct/16] + bits[oct%16])); done
+  printf '%s\n' "$add"
 }
 
-load_blocklist_into_ipsets() {
-  local listfile="$1"
-
-  # Only create/flush sets that we actually need
-  if (( HAS_V4 )); then
-    $SUDO ipset create "$SET_V4" hash:net family inet  -exist
-    $SUDO ipset flush  "$SET_V4"
+normalize_entry_basic() {
+  local raw="$1" ip nm
+  raw="$(echo "$raw" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [[ -n "$raw" ]] || return 1
+  if [[ "$raw" =~ ^([0-9]{1,3}(\.[0-9]{1,3}){3})[[:space:]]+([0-9]{1,3}(\.[0-9]{1,3}){3})$ ]]; then
+    ip="${BASH_REMATCH[1]}"; nm="${BASH_REMATCH[3]}"; HAS_IPV4=1
+    printf '%s/%s\n' "$ip" "$(mask_to_prefix "$nm")"; return 0
   fi
-  if (( HAS_V6 )) && have ip6tables; then
-    $SUDO ipset create "$SET_V6" hash:net family inet6 -exist
-    $SUDO ipset flush  "$SET_V6"
-  fi
-
-  while read -r a b _; do
-    [[ -z "${a:-}" || "${a:0:1}" == "#" ]] && continue
-    if [[ "$a" == *:* ]]; then
-      (( HAS_V6 )) && $SUDO ipset add "$SET_V6" "$a" -exist || true
-    else
-      if (( HAS_V4 )); then
-        local entry="$a"
-        if [[ -n "${b:-}" ]]; then entry="$a/$(prefix_from_mask "$b")"; fi
-        $SUDO ipset add "$SET_V4" "$entry" -exist
-      fi
-    fi
-  done < "$listfile"
+  if is_ipv4_cidr_or_ip "$raw"; then HAS_IPV4=1; printf '%s\n' "$raw"; return 0; fi
+  if is_ipv6_any "$raw"; then HAS_IPV6=1; printf '%s\n' "$raw"; return 0; fi
+  return 1
 }
 
-# --------------------------- Chains & jump rules -------------------------------
-ensure_chain_rules_v4() {
-  $SUDO iptables -N "$CHAIN_V4" 2>/dev/null || true
-  $SUDO iptables -F "$CHAIN_V4"
-  $SUDO iptables -A "$CHAIN_V4" -m limit --limit "$LOG_LIMIT" -j LOG --log-prefix "IPBLOCK v4: " --log-level "$LOG_LVL"
-  $SUDO iptables -A "$CHAIN_V4" -p tcp -j REJECT --reject-with tcp-reset
-  $SUDO iptables -A "$CHAIN_V4" -j REJECT
-}
-
-ensure_chain_rules_v6() {
-  $SUDO ip6tables -N "$CHAIN_V6" 2>/dev/null || true
-  $SUDO ip6tables -F "$CHAIN_V6"
-  $SUDO ip6tables -A "$CHAIN_V6" -m limit --limit "$LOG_LIMIT" -j LOG --log-prefix "IPBLOCK v6: " --log-level "$LOG_LVL"
-  $SUDO ip6tables -A "$CHAIN_V6" -p tcp -j REJECT --reject-with tcp-reset
-  $SUDO ip6tables -A "$CHAIN_V6" -j REJECT
-}
-
-ensure_jump_rule() {
-  local fam="$1" iface="$2" setname="$3" chainname="$4"
-  local ipt IFARG=()
-  [[ -n "$iface" ]] && IFARG=(-o "$iface")
-  [[ "$fam" == "v4" ]] && ipt="iptables" || ipt="ip6tables"
-
-  if ! $SUDO "$ipt" -C OUTPUT "${IFARG[@]}" -m set --match-set "$setname" dst -j "$chainname" 2>/dev/null; then
-    $SUDO "$ipt" -I OUTPUT 1 "${IFARG[@]}" -m set --match-set "$setname" dst -j "$chainname"
-  fi
-}
-
-remove_jump_rules_and_chains() {
-  local ipt="$1" chain="$2"
-  if ! have "$ipt"; then return 0; fi
-  while read -r line; do
-    [[ -z "${line:-}" ]] && continue
-    local del="${line/-A /-D }"
-    $SUDO "$ipt" $del || true
-  done < <($SUDO "$ipt" -S OUTPUT | grep -F " -j $chain" || true)
-  $SUDO "$ipt" -F "$chain" 2>/dev/null || true
-  $SUDO "$ipt" -X "$chain" 2>/dev/null || true
-}
-
-# --------------------------- Status / Printing --------------------------------
-print_status() {
-  echo
-  echo "== Status for set base '$SET_BASE' =="
-
-  if ipset_exists "$SET_V4"; then
-    $SUDO ipset list "$SET_V4" | awk '/^Name|Size in memory|Number of entries/ {print}'
+parse_oct_range() {
+  local spec="$1" a b
+  if [[ "$spec" =~ ^[0-9]+-[0-9]+$ ]]; then
+    IFS=- read -r a b <<<"$spec"; is_uint "$a" && is_uint "$b" || return 1
+    ((a>=0 && a<=255 && b>=0 && b<=255 && a<=b)) || return 1
+    echo "$a $b"
+  elif is_uint "$spec"; then
+    ((spec>=0 && spec<=255)) || return 1; echo "$spec $spec"
   else
-    echo "(no IPv4 set present: $SET_V4)"
+    return 1
   fi
+}
 
-  # Only show IPv6 section if a v6 set or chain exists
-  if ipset_exists "$SET_V6" || chain_exists ip6tables "$CHAIN_V6" || any_rules_jump_to_chain ip6tables "$CHAIN_V6"; then
-    if ipset_exists "$SET_V6"; then
-      $SUDO ipset list "$SET_V6" | awk '/^Name|Size in memory|Number of entries/ {print}'
+expand_csv_nmapstyle() {
+  local csv="$1" tok
+  IFS=, read -ra TOKS <<<"$csv"
+  for tok in "${TOKS[@]}"; do
+    tok="$(echo "$tok" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    [[ -z "$tok" ]] && continue
+    if normalize_entry_basic "$tok"; then continue; fi
+    local p0 p1 p2 p3
+    IFS='.' read -r p0 p1 p2 p3 <<<"$tok"
+    [[ -n "$p0" && -n "$p1" && -n "$p2" && -n "$p3" ]] || die "Unrecognized token '$tok'"
+    local r0 r1 r2 r3 a0 b0 a1 b1 a2 b2 a3 b3
+    r0="$(parse_oct_range "$p0")" || die "Bad nmap-style range '$tok'"
+    r1="$(parse_oct_range "$p1")" || die "Bad nmap-style range '$tok'"
+    r2="$(parse_oct_range "$p2")" || die "Bad nmap-style range '$tok'"
+    r3="$(parse_oct_range "$p3")" || die "Bad nmap-style range '$tok'"
+    read -r a0 b0 <<<"$r0"; read -r a1 b1 <<<"$r1"; read -r a2 b2 <<<"$r2"; read -r a3 b3 <<<"$r3"
+    if [[ "$p0" != *-* && "$p1" != *-* && "$p2" != *-* && "$p3" != *-* ]]; then die "Unrecognized token '$tok'"; fi
+    local c0=$((b0-a0+1)) c1=$((b1-a1+1)) c2=$((b2-a2+1)) c3=$((b3-a3+1)) total=$((c0*c1*c2*c3))
+    (( total <= BL_MAX_EXPAND )) || die "Expansion of '$tok' would produce ${total} IPs (> ${BL_MAX_EXPAND}). Use CIDR."
+    HAS_IPV4=1
+    local A B C D
+    for ((A=a0; A<=b0; A++)); do
+      for ((B=a1; B<=b1; B++)); do
+        for ((C=a2; C<=b2; C++)); do
+          for ((D=a3; D<=b3; D++)); do
+            printf '%d.%d.%d.%d\n' "$A" "$B" "$C" "$D"
+          done
+        done
+      done
+    done
+  done
+}
+
+parse_blocklist_arg() {
+  local src="$1"
+  if [[ -e "$src" && ! -d "$src" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%%#*}"
+      line="$(echo "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+      [[ -z "$line" ]] && continue
+      expand_csv_nmapstyle "$line"
+    done < "$src"
+  else
+    [[ -d "$src" ]] && die "-bl points to a directory: $src"
+    expand_csv_nmapstyle "$src"
+  fi
+}
+
+# ------------------------------- nft helpers -----------------------------------
+nft_ensure_inet() {
+  nft list table inet "$NFT_INET_TABLE" >/dev/null 2>&1 || nft add table inet "$NFT_INET_TABLE"
+  nft list chain inet "$NFT_INET_TABLE" "$NFT_OUT_CHAIN" >/dev/null 2>&1 || \
+    nft add chain inet "$NFT_INET_TABLE" "$NFT_OUT_CHAIN" "{ type filter hook output priority $NFT_HOOK_PRIO; }"
+}
+
+nft_ensure_netdev() {
+  nft list table netdev "$NFT_NETDEV_TABLE" >/dev/null 2>&1 || nft add table netdev "$NFT_NETDEV_TABLE"
+}
+
+nft_chain_netdev_for_iface() {
+  local iface="$1"
+  printf 'egress_%s' "$iface"
+}
+
+nft_ensure_netdev_chain_iface() {
+  local iface="$1" chain
+  chain="$(nft_chain_netdev_for_iface "$iface")"
+  nft list chain netdev "$NFT_NETDEV_TABLE" "$chain" >/dev/null 2>&1 || \
+    nft add chain netdev "$NFT_NETDEV_TABLE" "$chain" "{ type filter hook egress device \"$iface\" priority $NFT_HOOK_PRIO; }"
+}
+
+nft_set_v4() { printf 'v4_%s' "$1"; }
+nft_set_v6() { printf 'v6_%s' "$1"; }
+
+nft_ensure_sets_for_set() {
+  local set="$1" v4 v6
+  v4="$(nft_set_v4 "$set")"; v6="$(nft_set_v6 "$set")"
+  nft_ensure_inet
+  nft list set inet "$NFT_INET_TABLE" "$v4" >/dev/null 2>&1 || nft add set inet "$NFT_INET_TABLE" "$v4" '{ type ipv4_addr; flags interval; }'
+  nft list set inet "$NFT_INET_TABLE" "$v6" >/dev/null 2>&1 || nft add set inet "$NFT_INET_TABLE" "$v6" '{ type ipv6_addr; flags interval; }'
+  nft_ensure_netdev
+  nft list set netdev "$NFT_NETDEV_TABLE" "$v4" >/dev/null 2>&1 || nft add set netdev "$NFT_NETDEV_TABLE" "$v4" '{ type ipv4_addr; flags interval; }'
+  nft list set netdev "$NFT_NETDEV_TABLE" "$v6" >/dev/null 2>&1 || nft add set netdev "$NFT_NETDEV_TABLE" "$v6" '{ type ipv6_addr; flags interval; }'
+}
+
+nft_add_elements_dual() {
+  local set="$1"; shift
+  local v4 v6 elem
+  v4="$(nft_set_v4 "$set")"; v6="$(nft_set_v6 "$set")"
+  for elem in "$@"; do
+    if [[ "$elem" == *:* ]]; then
+      nft add element inet  "$NFT_INET_TABLE"   "$v6" "{ $elem }"
+      nft add element netdev "$NFT_NETDEV_TABLE" "$v6" "{ $elem }"
+      HAS_IPV6=1
     else
-      echo "(no IPv6 set present: $SET_V6)"
+      nft add element inet  "$NFT_INET_TABLE"   "$v4" "{ $elem }"
+      nft add element netdev "$NFT_NETDEV_TABLE" "$v4" "{ $elem }"
+      HAS_IPV4=1
     fi
+  done
+}
+
+nft_flush_set_dual() {
+  local set="$1" v4 v6
+  v4="$(nft_set_v4 "$set")"; v6="$(nft_set_v6 "$set")"
+  nft flush set inet  "$NFT_INET_TABLE" "$v4" 2>/dev/null || true
+  nft flush set inet  "$NFT_INET_TABLE" "$v6" 2>/dev/null || true
+  nft flush set netdev "$NFT_NETDEV_TABLE" "$v4" 2>/dev/null || true
+  nft flush set netdev "$NFT_NETDEV_TABLE" "$v6" 2>/dev/null || true
+}
+
+nft_destroy_set_dual() {
+  local set="$1" v4 v6
+  v4="$(nft_set_v4 "$set")"; v6="$(nft_set_v6 "$set")"
+  nft delete set inet  "$NFT_INET_TABLE" "$v4" 2>/dev/null || true
+  nft delete set inet  "$NFT_INET_TABLE" "$v6" 2>/dev/null || true
+  nft delete set netdev "$NFT_NETDEV_TABLE" "$v4" 2>/dev/null || true
+  nft delete set netdev "$NFT_NETDEV_TABLE" "$v6" 2>/dev/null || true
+}
+
+out_rule_comment() { printf '%s:%s:%s' "$COMMENT_PREFIX" "$1" "out"; }
+egress_rule_comment() { printf '%s:%s:%s' "$COMMENT_PREFIX" "$1" "egress"; }
+
+nft_rule_exists_out() {
+  local set="$1"
+  nft list chain inet "$NFT_INET_TABLE" "$NFT_OUT_CHAIN" 2>/dev/null | grep -q "comment \"$(out_rule_comment "$set")\"" && return 0 || return 1
+}
+
+# -------------------------- ADD RULES (with quoted comments) -------------------
+nft_add_out_rules() {
+  local set="$1" iface="${2:-}"
+  nft_ensure_inet
+  local v4 v6 comment; v4="$(nft_set_v4 "$set")"; v6="$(nft_set_v6 "$set")"; comment="$(out_rule_comment "$set")"
+  if [[ -z "${iface:-}" || "${iface}" == "all" || "${iface}" == "any" || "${iface}" == "*" ]]; then
+    nft add rule inet "$NFT_INET_TABLE" "$NFT_OUT_CHAIN" ip  daddr @"$v4" reject with icmpx type admin-prohibited comment \""$comment"\"
+    nft add rule inet "$NFT_INET_TABLE" "$NFT_OUT_CHAIN" ip6 daddr @"$v6" reject with icmpx type admin-prohibited comment \""$comment"\"
+  else
+    nft add rule inet "$NFT_INET_TABLE" "$NFT_OUT_CHAIN" oifname "$iface" ip  daddr @"$v4" reject with icmpx type admin-prohibited comment \""$comment"\"
+    nft add rule inet "$NFT_INET_TABLE" "$NFT_OUT_CHAIN" oifname "$iface" ip6 daddr @"$v6" reject with icmpx type admin-prohibited comment \""$comment"\"
+  fi
+}
+
+nft_add_netdev_rules_for_iface() {
+  local set="$1" iface="$2" v4 v6 comment chain
+  nft_ensure_netdev
+  nft_ensure_netdev_chain_iface "$iface"
+  v4="$(nft_set_v4 "$set")"; v6="$(nft_set_v6 "$set")"; chain="$(nft_chain_netdev_for_iface "$iface")"
+  comment="$(egress_rule_comment "$set")"
+  nft add rule netdev "$NFT_NETDEV_TABLE" "$chain" ip  daddr @"$v4" drop comment \""$comment"\"
+  nft add rule netdev "$NFT_NETDEV_TABLE" "$chain" ip6 daddr @"$v6" drop comment \""$comment"\"
+  nft add rule netdev "$NFT_NETDEV_TABLE" "$chain" vlan type ip  ip  daddr @"$v4" drop comment \""$comment"\"
+  nft add rule netdev "$NFT_NETDEV_TABLE" "$chain" vlan type ip6 ip6 daddr @"$v6" drop comment \""$comment"\"
+}
+
+# Delete rules by comment (handles across tables/chains)
+nft_delete_rules_by_comment() {
+  local family="$1" table="$2" comment="$3"
+  nft -a list table "$family" "$table" 2>/dev/null | \
+    awk -v c="$comment" '
+      $1=="chain" {ch=$2}
+      / handle [0-9]+/ && index($0,c)>0 {for(i=1;i<=NF;i++) if($i=="handle") print ch" " $(i+1)}
+    ' | while read -r ch h; do
+      nft delete rule "$family" "$table" "$ch" handle "$h" 2>/dev/null || true
+    done
+}
+
+# Discover which netdev egress chains currently carry this set's rules
+nft_existing_ifaces_for_set() {
+  local set="$1" comment
+  comment="$(egress_rule_comment "$set")"
+  nft list table netdev "$NFT_NETDEV_TABLE" 2>/dev/null | \
+    awk -v c="$comment" '
+      $1=="chain" && $2 ~ /^egress_/ {ch=$2}
+      index($0,c)>0 {print ch}
+    ' | sed 's/^egress_//'
+}
+
+# ------------------------------ High-level ops ---------------------------------
+ensure_sets_and_load() {
+  local setname="$1"; shift
+  nft_ensure_sets_for_set "$setname"
+  [[ $# -gt 0 ]] || die "No valid blocklist entries were parsed."
+  nft_add_elements_dual "$setname" "$@"
+  local v4 v6 c4 c6
+  v4="$(nft_set_v4 "$setname")"; v6="$(nft_set_v6 "$setname")"
+  c4="$(nft list set inet "$NFT_INET_TABLE" "$v4" 2>/dev/null | awk '/elements/ {print}' | wc -c | tr -d ' ')"
+  c6="$(nft list set inet "$NFT_INET_TABLE" "$v6" 2>/dev/null | awk '/elements/ {print}' | wc -c | tr -d ' ')"
+  log "nft sets ready for '$setname' (v4:${c4:-0}b, v6:${c6:-0}b)."
+}
+
+enable_rules() {
+  local set="$1" iface_in="${2:-}"
+  local iface; iface="$(resolve_iface_hint "$iface_in")"
+  nft_add_out_rules "$set" "$iface"
+  if [[ "$iface" == "all" ]]; then
+    all_ifaces | while read -r ifc; do [[ -n "$ifc" ]] && nft_add_netdev_rules_for_iface "$set" "$ifc"; done
+  else
+    nft_add_netdev_rules_for_iface "$set" "$iface"
+  fi
+  log "Enabled nft rules for set '$set' on iface '${iface}'."
+}
+
+disable_rules() {
+  local set="$1"
+  nft_delete_rules_by_comment inet  "$NFT_INET_TABLE"   "$(out_rule_comment "$set")"
+  nft_delete_rules_by_comment netdev "$NFT_NETDEV_TABLE" "$(egress_rule_comment "$set")"
+  log "Disabled nft rules for set '$set'."
+}
+
+rename_set() {
+  local old="$1" new="$2"
+  [[ -n "$old" && -n "$new" ]] || die "'rename' requires -sn OLD and -nn NEW."
+
+  local existing_ifaces; existing_ifaces="$(nft_existing_ifaces_for_set "$old" || true)"
+
+  local v4o v6o v4n v6n
+  v4o="$(nft_set_v4 "$old")"; v6o="$(nft_set_v6 "$old")"
+  v4n="$(nft_set_v4 "$new")"; v6n="$(nft_set_v6 "$new")"
+
+  nft_ensure_inet; nft_ensure_netdev
+  if nft list set inet "$NFT_INET_TABLE" "$v4n" >/dev/null 2>&1; then
+    nft add element inet "$NFT_INET_TABLE" "$v4n" "{ $(nft list set inet "$NFT_INET_TABLE" "$v4o" | awk -F'=' '/elements/{print $2}' | sed 's/[{};]//g') }" 2>/dev/null || true
+    nft delete set inet "$NFT_INET_TABLE" "$v4o" 2>/dev/null || true
+  else
+    nft rename set inet "$NFT_INET_TABLE" "$v4o" "$v4n"
+  fi
+  if nft list set inet "$NFT_INET_TABLE" "$v6n" >/dev/null 2>&1; then
+    nft add element inet "$NFT_INET_TABLE" "$v6n" "{ $(nft list set inet "$NFT_INET_TABLE" "$v6o" | awk -F'=' '/elements/{print $2}' | sed 's/[{};]//g') }" 2>/dev/null || true
+    nft delete set inet "$NFT_INET_TABLE" "$v6o" 2>/dev/null || true
+  else
+    nft rename set inet "$NFT_INET_TABLE" "$v6o" "$v6n"
+  fi
+  if nft list set netdev "$NFT_NETDEV_TABLE" "$v4n" >/dev/null 2>&1; then
+    nft add element netdev "$NFT_NETDEV_TABLE" "$v4n" "{ $(nft list set netdev "$NFT_NETDEV_TABLE" "$v4o" | awk -F'=' '/elements/{print $2}' | sed 's/[{};]//g') }" 2>/dev/null || true
+    nft delete set netdev "$NFT_NETDEV_TABLE" "$v4o" 2>/dev/null || true
+  else
+    nft rename set netdev "$NFT_NETDEV_TABLE" "$v4o" "$v4n"
+  fi
+  if nft list set netdev "$NFT_NETDEV_TABLE" "$v6n" >/dev/null 2>&1; then
+    nft add element netdev "$NFT_NETDEV_TABLE" "$v6n" "{ $(nft list set netdev "$NFT_NETDEV_TABLE" "$v6o" | awk -F'=' '/elements/{print $2}' | sed 's/[{};]//g') }" 2>/dev/null || true
+    nft delete set netdev "$NFT_NETDEV_TABLE" "$v6o" 2>/dev/null || true
+  else
+    nft rename set netdev "$NFT_NETDEV_TABLE" "$v6o" "$v6n"
   fi
 
-  echo
-  echo "== IPv4 OUTPUT (top 20) =="
-  $SUDO iptables -L OUTPUT -n -v --line-numbers | sed -n '1,20p'
+  disable_rules "$old"
+  if [[ -n "$existing_ifaces" ]]; then
+    while read -r ifc; do [[ -n "$ifc" ]] && enable_rules "$new" "$ifc"; done <<< "$existing_ifaces"
+  fi
+  log "Renamed set '$old' -> '$new' and updated nft rules."
+}
 
-  # Only print IPv6 table if v6 chain or jump rules exist
-  if chain_exists ip6tables "$CHAIN_V6" || any_rules_jump_to_chain ip6tables "$CHAIN_V6"; then
-    echo
-    echo "== IPv6 OUTPUT (top 20) =="
-    $SUDO ip6tables -L OUTPUT -n -v --line-numbers | sed -n '1,20p'
+list_sets() {
+  local which="${1:-all}"
+  if [[ "$which" == "all" || -z "$which" ]]; then
+    echo "### inet:$NFT_INET_TABLE sets:"
+    nft list table inet "$NFT_INET_TABLE" 2>/dev/null || echo "  (none)"
+    echo; echo "### netdev:$NFT_NETDEV_TABLE sets:"
+    nft list table netdev "$NFT_NETDEV_TABLE" 2>/dev/null || echo "  (none)"
+  else
+    local v4 v6; v4="$(nft_set_v4 "$which")"; v6="$(nft_set_v6 "$which")"
+    echo "### inet sets for '$which':"
+    nft list set inet "$NFT_INET_TABLE" "$v4" 2>/dev/null || echo "  (no v4 set)"; echo
+    nft list set inet "$NFT_INET_TABLE" "$v6" 2>/dev/null || echo "  (no v6 set)"; echo
+    echo "### netdev sets for '$which':"
+    nft list set netdev "$NFT_NETDEV_TABLE" "$v4" 2>/dev/null || echo "  (no v4 set)"; echo
+    nft list set netdev "$NFT_NETDEV_TABLE" "$v6" 2>/dev/null || echo "  (no v6 set)"
   fi
 }
 
-# ------------------------------- Parsers --------------------------------------
-# Accepts "--key value" or "--key=value"
-kv() { local k="$1" v="${2:-}"; if [[ "$k" == *=* ]]; then echo "${k#*=}"; else echo "$v"; fi; }
-
-parse_apply() {
-  BLOCKLIST="$BLOCKLIST_DEFAULT"; IFACE=""; BACKUP_DIR="$BACKUP_DIR_DEFAULT"
-  LOG_LIMIT="$LOG_LIMIT_DEFAULT"; LOG_LVL="$LOG_LVL_DEFAULT"; SETNAME=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --set-name|--set-name=*)  SETNAME="$(kv "$1" "${2:-}")"; shift $([[ "$1" == *=* ]] || echo 1);;
-      --blocklist|--blocklist=*) BLOCKLIST="$(kv "$1" "${2:-}")"; shift $([[ "$1" == *=* ]] || echo 1);;
-      --iface|--iface=*)        IFACE="$(kv "$1" "${2:-}")";     shift $([[ "$1" == *=* ]] || echo 1);;
-      --backup-dir|--backup-dir=*) BACKUP_DIR="$(kv "$1" "${2:-}")"; shift $([[ "$1" == *=* ]] || echo 1);;
-      --log-limit|--log-limit=*) LOG_LIMIT="$(kv "$1" "${2:-}")"; shift $([[ "$1" == *=* ]] || echo 1);;
-      --log-level|--log-level=*) LOG_LVL="$(kv "$1" "${2:-}")";   shift $([[ "$1" == *=* ]] || echo 1);;
-      -h|--help) usage; exit 0;;
-      *) echo "Unknown flag for apply: $1"; usage; exit 1;;
-    esac; shift || true
-  done
-  [[ -n "$SETNAME" ]] || { echo "ERROR: --set-name is required for apply"; exit 1; }
+list_rules() {
+  local which="${1:-all}"
+  if [[ "$which" == "all" ]]; then
+    echo "### inet rules (chain: $NFT_OUT_CHAIN):"
+    nft list chain inet "$NFT_INET_TABLE" "$NFT_OUT_CHAIN" 2>/dev/null || echo "  (none)"
+    echo; echo "### netdev rules:"
+    nft list table netdev "$NFT_NETDEV_TABLE" 2>/dev/null || echo "  (none)"
+  else
+    local c_out c_eg
+    c_out="$(out_rule_comment "$which")"; c_eg="$(egress_rule_comment "$which")"
+    echo "### inet rules for '$which':"
+    nft list chain inet "$NFT_INET_TABLE" "$NFT_OUT_CHAIN" 2>/dev/null | grep -F "$c_out" || echo "  (none)"
+    echo; echo "### netdev rules for '$which':"
+    nft list table netdev "$NFT_NETDEV_TABLE" 2>/dev/null | grep -F "$c_eg" || echo "  (none)"
+  fi
 }
 
-parse_clear() {
-  BACKUP_DIR="$BACKUP_DIR_DEFAULT"; SETNAME=""; DELETE_SETS="no"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --set-name|--set-name=*) SETNAME="$(kv "$1" "${2:-}")"; shift $([[ "$1" == *=* ]] || echo 1);;
-      --delete-sets) DELETE_SETS="yes";;
-      --backup-dir|--backup-dir=*) BACKUP_DIR="$(kv "$1" "${2:-}")"; shift $([[ "$1" == *=* ]] || echo 1);;
-      -h|--help) usage; exit 0;;
-      *) echo "Unknown flag for clear: $1"; usage; exit 1;;
-    esac; shift || true
-  done
-  [[ -n "$SETNAME" ]] || { echo "ERROR: --set-name is required for clear"; exit 1; }
-}
-
-parse_status() {
-  SETNAME=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --set-name|--set-name=*) SETNAME="$(kv "$1" "${2:-}")"; shift $([[ "$1" == *=* ]] || echo 1);;
-      -h|--help) usage; exit 0;;
-      *) echo "Unknown flag for status: $1"; usage; exit 1;;
-    esac; shift || true
-  done
-  [[ -n "$SETNAME" ]] || { echo "ERROR: --set-name is required for status"; exit 1; }
-}
-
-parse_restore() {
-  BACKUP_DIR="$BACKUP_DIR_DEFAULT"; SNAPSHOT="latest"
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --snapshot|--snapshot=*) SNAPSHOT="$(kv "$1" "${2:-}")"; shift $([[ "$1" == *=* ]] || echo 1);;
-      --backup-dir|--backup-dir=*) BACKUP_DIR="$(kv "$1" "${2:-}")"; shift $([[ "$1" == *=* ]] || echo 1);;
-      -h|--help) usage; exit 0;;
-      *) echo "Unknown flag for restore: $1"; usage; exit 1;;
-    esac; shift || true
-  done
-}
-
-# --------------------------------- Actions ------------------------------------
-do_apply() {
-  check_deps
-  update_names_from_basename "$SETNAME"
-  scan_blocklist "$BLOCKLIST"
-
-  if (( HAS_V4==0 && HAS_V6==0 )); then
-    echo "NOTE: No IPv4 or IPv6 entries found in '$BLOCKLIST'. Nothing to apply."
+status_set() {
+  local set="${1:-all}"
+  if [[ "$set" == "all" ]]; then
+    echo "### Sets overview:"
+    list_sets "all"
+    echo; echo "### Rules overview:"
+    list_rules "all"
     return 0
   fi
+  echo "### Sets for '$set':"; list_sets "$set"
+  echo; echo "### Rules for '$set':"; list_rules "$set"
+}
 
-  mkdir -p "$BACKUP_DIR"
-  local snapdir; snapdir="$(make_snapshot_dir "$BACKUP_DIR")"
-  save_snapshot "$snapdir"
-
-  trap 'echo "ERROR occurred. Restoring original rules..."; restore_snapshot "'"$snapdir"'"' ERR INT
-
-  echo "== Loading blocklist '$BLOCKLIST' into ipsets =="; load_blocklist_into_ipsets "$BLOCKLIST"
-
-  if (( HAS_V4 )); then
-    echo "== Ensuring chains/rules (IPv4: $CHAIN_V4) =="
-    ensure_chain_rules_v4
-    ensure_jump_rule "v4" "$IFACE" "$SET_V4" "$CHAIN_V4"
+flush_rules() {
+  local target="$1"
+  if [[ "$target" == "all" ]]; then
+    nft_delete_rules_by_comment inet  "$NFT_INET_TABLE"   "${COMMENT_PREFIX}:"
+    nft_delete_rules_by_comment netdev "$NFT_NETDEV_TABLE" "${COMMENT_PREFIX}:"
+    log "Flushed all nft rules managed by ${COMMENT_PREFIX}."
   else
-    echo "(Skipping IPv4: no IPv4 entries detected.)"
+    disable_rules "$target"
   fi
+}
 
-  if (( HAS_V6 )) && have ip6tables; then
-    echo "== Ensuring chains/rules (IPv6: $CHAIN_V6) =="
-    ensure_chain_rules_v6
-    ensure_jump_rule "v6" "$IFACE" "$SET_V6" "$CHAIN_V6"
+flush_sets() {
+  local target="$1"
+  if [[ "$target" == "all" ]]; then
+    for fam in inet netdev; do
+      nft list table "$fam" "$([[ $fam == inet ]] && echo $NFT_INET_TABLE || echo $NFT_NETDEV_TABLE)" 2>/dev/null | \
+        awk '/^ *set (v[46]_[^ ]+)/ {print $2}' | while read -r s; do
+          nft flush set "$fam" "$([[ $fam == inet ]] && echo $NFT_INET_TABLE || echo $NFT_NETDEV_TABLE)" "$s" 2>/dev/null || true
+        done
+    done
+    log "Flushed all v4_/v6_ sets."
   else
-    echo "(Skipping IPv6: no IPv6 entries detected or ip6tables not available.)"
+    nft_flush_set_dual "$target"
+    log "Flushed sets for '$target'."
   fi
-
-  trap - ERR INT
-  echo "Apply complete."
-  print_status
 }
 
-do_clear() {
-  check_deps
-  update_names_from_basename "$SETNAME"
-
-  mkdir -p "$BACKUP_DIR"
-  local snapdir; snapdir="$(make_snapshot_dir "$BACKUP_DIR")"
-  save_snapshot "$snapdir"
-
-  trap 'echo "ERROR occurred during clear. Restoring original rules..."; restore_snapshot "'"$snapdir"'"' ERR INT
-
-  echo "== Removing OUTPUT jump rules and chains for '$SET_BASE' =="
-  remove_jump_rules_and_chains iptables  "$CHAIN_V4"
-  # Only touch IPv6 if a v6 chain or set actually exists
-  if chain_exists ip6tables "$CHAIN_V6" || ipset_exists "$SET_V6" || any_rules_jump_to_chain ip6tables "$CHAIN_V6"; then
-    remove_jump_rules_and_chains ip6tables "$CHAIN_V6"
+destroy_sets() {
+  local target="$1"
+  if [[ "$target" == "all" ]]; then
+    flush_rules "all"
+    for fam in inet netdev; do
+      nft list table "$fam" "$([[ $fam == inet ]] && echo $NFT_INET_TABLE || echo $NFT_NETDEV_TABLE)" 2>/dev/null | \
+        awk '/^ *set (v[46]_[^ ]+)/ {print $2}' | while read -r s; do
+          nft delete set "$fam" "$([[ $fam == inet ]] && echo $NFT_INET_TABLE || echo $NFT_NETDEV_TABLE)" "$s" 2>/dev/null || true
+        done
+    done
+    log "Destroyed all v4_/v6_ sets."
+  else
+    disable_rules "$target"
+    nft_destroy_set_dual "$target"
+    log "Destroyed sets for '$target'."
   fi
-
-  echo "== Clearing ipsets =="
-  if ipset_exists "$SET_V4"; then
-    if [[ "${DELETE_SETS:-no}" == "yes" ]]; then $SUDO ipset destroy "$SET_V4" 2>/dev/null || true; else $SUDO ipset flush "$SET_V4" 2>/dev/null || true; fi
-  fi
-  if ipset_exists "$SET_V6"; then
-    if [[ "${DELETE_SETS:-no}" == "yes" ]]; then $SUDO ipset destroy "$SET_V6" 2>/dev/null || true; else $SUDO ipset flush "$SET_V6" 2>/dev/null || true; fi
-  fi
-  [[ "${DELETE_SETS:-no}" == "yes" ]] && echo "Destroyed existing sets." || echo "Flushed existing sets."
-
-  trap - ERR INT
-  echo "Clear complete."
-  print_status
 }
 
-do_status() {
-  check_deps
-  update_names_from_basename "$SETNAME"
-  print_status
+backup_configs() {
+  local outdir="${1:-$BACKUP_DIR_DEFAULT}"
+  mkdir -p "$outdir"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  nft list ruleset > "$tmpdir/nft.ruleset"
+  local tarpath="$outdir/blacklist-backup-${STAMP}.tar.gz"
+  tar -C "$tmpdir" -czf "$tarpath" .
+  rm -rf "$tmpdir"
+  echo "Backup created: $tarpath"
 }
 
-do_restore() {
-  check_deps
-  local snapdir="$SNAPSHOT"
-  if [[ "$SNAPSHOT" == "latest" ]]; then
-    snapdir="$(latest_snapshot "$BACKUP_DIR" || true)"
-    [[ -n "$snapdir" ]] || { echo "ERROR: No snapshots found in $BACKUP_DIR"; exit 1; }
-  fi
-  restore_snapshot "$snapdir"
+restore_configs() {
+  local archive="$1"
+  [[ -f "$archive" ]] || die "Backup archive not found: $archive"
+  local tmpdir; tmpdir="$(mktemp -d)"
+  tar -C "$tmpdir" -xzf "$archive"
+  [[ -f "$tmpdir/nft.ruleset" ]] || die "nft.ruleset not found in archive."
+  nft -f "$tmpdir/nft.ruleset"
+  rm -rf "$tmpdir"
+  echo "Restore completed from: $archive"
 }
 
-# ----------------------------------- Main -------------------------------------
-ACTION="${1:-}"
-[[ -z "$ACTION" || "$ACTION" == "-h" || "$ACTION" == "--help" ]] && { usage; exit 0; }
-shift
+# ------------------------------- CLI Parsing -----------------------------------
+cmd="${1:-}"; [[ -z "$cmd" || "$cmd" == "-h" || "$cmd" == "--help" ]] && { usage; exit 0; }
+shift || true
 
-case "$ACTION" in
-  apply)   parse_apply   "$@"; do_apply   ;;
-  clear)   parse_clear   "$@"; do_clear   ;;
-  status)  parse_status  "$@"; do_status  ;;
-  restore) parse_restore "$@"; do_restore ;;
-  *) echo "Unknown action: $ACTION"; usage; exit 1;;
+require_root
+check_deps
+
+SET_NAME=""
+NEW_NAME=""
+BLOCKLIST_ARG=""
+IFACE=""
+BACKUP_DIR="$BACKUP_DIR_DEFAULT"
+BACKUP_FILE=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -sn|--set-name)    SET_NAME="${2:-}"; shift 2;;
+    -nn|--new-name)    NEW_NAME="${2:-}"; shift 2;;
+    -bl|--blocklist)   BLOCKLIST_ARG="${2:-}"; shift 2;;
+    -i|--iface)        IFACE="${2:-}"; shift 2;;
+    -d|--dir)          BACKUP_DIR="${2:-}"; shift 2;;
+    -f|--file)         BACKUP_FILE="${2:-}"; shift 2;;
+    -h|--help)         usage; exit 0;;
+    --) shift; break;;
+    *) die "Unknown option: $1";;
+  esac
+done
+
+# ------------------------------- Commands --------------------------------------
+case "$cmd" in
+  create)
+    [[ -n "$SET_NAME" ]] || SET_NAME="$STAMP"
+    [[ -n "$BLOCKLIST_ARG" ]] || die "'create' requires -bl/--blocklist."
+    mapfile -t ENTRIES < <(parse_blocklist_arg "$BLOCKLIST_ARG")
+    HAS_IPV4=0; HAS_IPV6=0
+    nft_ensure_sets_for_set "$SET_NAME"
+    ensure_sets_and_load "$SET_NAME" "${ENTRIES[@]}"
+    log "Set '$SET_NAME' created/loaded. Use 'enable -sn $SET_NAME [-i IFACE]' to enforce."
+    ;;
+
+  enable)
+    [[ -n "$SET_NAME" ]] || die "'enable' requires -sn/--set-name."
+    nft_ensure_sets_for_set "$SET_NAME"
+    enable_rules "$SET_NAME" "${IFACE:-}"
+    ;;
+
+  disable)
+    [[ -n "$SET_NAME" ]] || die "'disable' requires -sn/--set-name."
+    disable_rules "$SET_NAME"
+    ;;
+
+  rename)
+    [[ -n "$SET_NAME" && -n "$NEW_NAME" ]] || die "'rename' requires -sn OLD and -nn NEW."
+    rename_set "$SET_NAME" "$NEW_NAME"
+    ;;
+
+  list-sets)
+    if [[ -z "${SET_NAME:-}" || "${SET_NAME}" == "all" ]]; then list_sets "all"; else list_sets "$SET_NAME"; fi
+    ;;
+
+  list-tables)
+    if [[ -z "${SET_NAME:-}" || "${SET_NAME}" == "all" ]]; then list_rules "all"; else list_rules "$SET_NAME"; fi
+    ;;
+
+  status)
+    status_set "${SET_NAME:-all}"
+    ;;
+
+  flush-table)
+    [[ -n "$SET_NAME" ]] || die "'flush-table' requires -sn NAME|all."
+    flush_rules "$SET_NAME"
+    ;;
+
+  flush-set)
+    [[ -n "$SET_NAME" ]] || die "'flush-set' requires -sn NAME|all."
+    flush_sets "$SET_NAME"
+    ;;
+
+  destroy-set)
+    [[ -n "$SET_NAME" ]] || die "'destroy-set' requires -sn NAME|all."
+    destroy_sets "$SET_NAME"
+    ;;
+
+  backup)
+    backup_configs "$BACKUP_DIR"
+    ;;
+
+  restore)
+    [[ -n "$BACKUP_FILE" ]] || die "'restore' requires -f /path/to/backup.tar.gz."
+    restore_configs "$BACKUP_FILE"
+    ;;
+
+  *)
+    die "Unknown command: $cmd (run with --help for usage)."
+    ;;
 esac
