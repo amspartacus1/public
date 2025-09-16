@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-  Stream-friendly ping + TCP port scanner with CSV (default) or JSON output, with optional progress indicators.
+  Stream-friendly ping + TCP port scanner with CSV (default) or JSON output, progress bars with percent/ETA,
+  and an interactive mode that prints open ports as they are discovered.
 
 .PARAMETER IPs
   Comma-separated IPs/CIDRs OR path to a text file (one IP/CIDR per line; '#' comments allowed).
@@ -30,10 +31,16 @@
   Number of IPs per chunk to process in parallel (default 4096).
 
 .PARAMETER ShowProgress
-  Show progress bars and rates during ping/scan.
+  Show progress bars and rates during ping/scan. Now auto-counts totals for percent + ETA.
 
 .PARAMETER EstimateTotal
-  Do a fast pre-count of total IPs to enable percent complete and ETA (adds a streaming pass).
+  (Backward-compatible no-op) Kept for compatibility; -ShowProgress already implies estimating totals.
+
+.PARAMETER Interactive
+  Print open ports to the console immediately as they are discovered (masscan-like).
+
+.PARAMETER Summary
+  Print a grouped summary at the end (suppressed in -Interactive mode). Off by default.
 #>
 
 param(
@@ -55,8 +62,17 @@ param(
   [int] $ChunkSize = 4096,
 
   [switch] $ShowProgress,
-  [switch] $EstimateTotal
+  [switch] $EstimateTotal,   # kept for compatibility; ignored (ShowProgress implies estimation)
+  [switch] $Interactive,
+  [switch] $Summary
 )
+
+# If user asked for ShowProgress, always estimate totals for %/ETA
+if ($ShowProgress -and -not $EstimateTotal) { $EstimateTotal = $true }
+
+# Force progress bars to render (preserve original)
+$__prevProgressPreference = $ProgressPreference
+if ($ShowProgress -and $ProgressPreference -ne 'Continue') { $ProgressPreference = 'Continue' }
 
 # ===== Version check =====
 $psVersion = $PSVersionTable.PSVersion
@@ -82,10 +98,9 @@ function Convert-UInt32ToIP {
                               ($Num -band 0xFF))
 }
 
-# Safe CIDR expansion using uint64 arithmetic (no -bnot / tricky shifts)
+# Safe CIDR expansion using uint64 arithmetic
 function Get-CIDRAddresses {
   param([Parameter(Mandatory)][string]$Cidr)
-
   $split = $Cidr.Split('/')
   if ($split.Count -ne 2) { return }
   $baseIp = $split[0]
@@ -97,30 +112,17 @@ function Get-CIDRAddresses {
   $baseNum64 = [uint64]$baseNum32
 
   $hostBits = 32 - $prefix
-
-  if ($hostBits -eq 0) {
-    # /32 -> single IP
-    $baseIp
-    return
-  }
-
+  if ($hostBits -eq 0) { $baseIp; return }
   if ($hostBits -eq 32) {
-    # /0 -> entire IPv4 space (WARNING: massive). Emit lazily if present.
-    for ($n64 = [uint64]0; $n64 -le [uint64]0xFFFFFFFF; $n64++) {
-      Convert-UInt32ToIP ([uint32]$n64)
-    }
+    for ($n64 = [uint64]0; $n64 -le [uint64]0xFFFFFFFF; $n64++) { Convert-UInt32ToIP ([uint32]$n64) }
     return
   }
 
-  # General case
   $blockSize = [uint64]1
-  $blockSize = $blockSize -shl $hostBits    # 2^(hostBits)
+  $blockSize = $blockSize -shl $hostBits
   $start64   = ([uint64]([math]::Floor($baseNum64 / $blockSize))) * $blockSize
   $end64     = $start64 + $blockSize - 1
-
-  for ($n64 = $start64; $n64 -le $end64; $n64++) {
-    Convert-UInt32ToIP ([uint32]$n64)
-  }
+  for ($n64 = $start64; $n64 -le $end64; $n64++) { Convert-UInt32ToIP ([uint32]$n64) }
 }
 
 # ===== Ports parser =====
@@ -154,11 +156,9 @@ function Get-InputIPsStream {
         if (-not $line) { continue }
         $t = $line.Trim()
         if ($t.Length -eq 0 -or $t[0] -eq '#') { continue }
-
         foreach ($seg in $t.Split(',')) {
           $s = $seg.Trim()
           if ($s.Length -eq 0) { continue }
-
           if ($s.Contains('/')) {
             foreach ($ip in Get-CIDRAddresses -Cidr $s) {
               $n = Convert-IPToUInt32 $ip
@@ -176,7 +176,6 @@ function Get-InputIPsStream {
     foreach ($seg in $IPsInput.Split(',')) {
       $s = $seg.Trim()
       if ($s.Length -eq 0) { continue }
-
       if ($s.Contains('/')) {
         foreach ($ip in Get-CIDRAddresses -Cidr $s) {
           $n = Convert-IPToUInt32 $ip
@@ -196,13 +195,11 @@ function Ensure-OutputPath {
   if (-not $Path) { return $null }
   $ext = [System.IO.Path]::GetExtension($Path)
   $desiredExt = if ($AsJson) { '.json' } else { '.csv' }
-  if ([string]::IsNullOrWhiteSpace($ext) -or ($ext.ToLower() -notin @('.csv','.json'))) {
-    return "$Path$desiredExt"
-  }
+  if ([string]::IsNullOrWhiteSpace($ext) -or ($ext.ToLower() -notin @('.csv','.json'))) { return "$Path$desiredExt" }
   return $Path
 }
 
-# JSON grouped exporter: { ip, ping[], ports[] } with epoch seconds (local clock)
+# JSON grouped exporter
 function Export-GroupedJson {
   param(
     [Parameter(Mandatory)] $PingRecords,
@@ -210,33 +207,22 @@ function Export-GroupedJson {
     [Parameter(Mandatory)] [string] $Path,
     [switch] $IncludeFailures
   )
-
   $byIp = @{}
-
   foreach ($p in $PingRecords) {
     if (-not $IncludeFailures -and $p.Status -ne 'SUCCESS') { continue }
-    if (-not $byIp.ContainsKey($p.Host)) {
-      $byIp[$p.Host] = [ordered]@{ ip=$p.Host; ping=@(); ports=@() }
-    }
+    if (-not $byIp.ContainsKey($p.Host)) { $byIp[$p.Host] = [ordered]@{ ip=$p.Host; ping=@(); ports=@() } }
     $pingStatus = if ($p.Status -eq 'SUCCESS') { 'success' } else { 'fail' }
     $byIp[$p.Host].ping += @{ timestamp = [string]$p.Timestamp; status = $pingStatus }
   }
-
   foreach ($r in $PortRecords) {
     if (-not $IncludeFailures -and $r.Status -ne 'OPEN') { continue }
-    if (-not $byIp.ContainsKey($r.Host)) {
-      $byIp[$r.Host] = [ordered]@{ ip=$r.Host; ping=@(); ports=@() }
-    }
+    if (-not $byIp.ContainsKey($r.Host)) { $byIp[$r.Host] = [ordered]@{ ip=$r.Host; ping=@(); ports=@() } }
     $portStatus = if ($r.Status -eq 'OPEN') { 'open' } else { 'closed' }
     $byIp[$r.Host].ports += @{ port = [int]$r.Port; status = $portStatus; timestamp = [string]$r.Timestamp }
   }
-
   $arr = @()
   foreach ($k in ($byIp.Keys | Sort-Object { [System.Version]$_ })) { $arr += $byIp[$k] }
-
-  # Always write a file, even if empty array
   if ($arr.Count -eq 0) { $arr = @() }
-
   $arr | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding UTF8
   Write-Host "Results saved to $Path (format: JSON)" -ForegroundColor Cyan
 }
@@ -249,7 +235,6 @@ function Export-CSVFlat {
     [Parameter(Mandatory)] [string] $Path,
     [switch] $IncludeFailures
   )
-
   $all = @()
   if ($IncludeFailures) {
     $all += $PingRecords
@@ -258,24 +243,19 @@ function Export-CSVFlat {
     $all += $PingRecords | Where-Object { $_.Status -eq 'SUCCESS' }
     $all += $PortRecords | Where-Object { $_.Status -eq 'OPEN' }
   }
-
   $flat = $all | Select-Object @{n='Type';e={$_.Type}},
                         @{n='Host';e={$_.Host}},
                         @{n='Port';e={if ($_.PSObject.Properties.Match('Port').Count){$_.Port}else{$null}}},
                         @{n='Status';e={$_.Status}},
                         @{n='Timestamp';e={$_.Timestamp}} |
           Sort-Object Host,Port,Type
-
-  # Always create the file; may be 0 rows if no successes and not -Verbose
   $flat | Export-Csv -LiteralPath $Path -Encoding UTF8 -NoTypeInformation
   Write-Host "Results saved to $Path ($($flat.Count) rows; format: CSV)" -ForegroundColor Cyan
 }
 
-# Epoch helper (host local time -> epoch seconds)
-function Get-LocalEpoch { [int64][System.DateTimeOffset]::Now.ToUnixTimeSeconds() }
-
 # ===== Progress helpers =====
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
+$progressIdEstimate = 0
 $progressIdPing = 1
 $progressIdScan = 2
 [int64]$processedPingHosts = 0
@@ -289,8 +269,9 @@ function Update-PingProgress {
   $script:processedPingHosts += [int64]$Added
   $rate = 0
   if ($sw.Elapsed.TotalSeconds -gt 0) { $rate = [int]($processedPingHosts / $sw.Elapsed.TotalSeconds) }
-  if ($EstimateTotal -and $totalIPsEstimate -gt 0) {
+  if ($totalIPsEstimate -gt 0) {
     $pct    = [int](100 * $processedPingHosts / $totalIPsEstimate)
+    if ($pct -gt 100) { $pct = 100 }
     $remain = $totalIPsEstimate - $processedPingHosts
     $etaSec = if ($rate -gt 0) { [int]($remain / $rate) } else { 0 }
     $status = "Pinged $processedPingHosts/$totalIPsEstimate hosts @ ~${rate}/s | ETA ~ ${etaSec}s"
@@ -308,8 +289,9 @@ function Update-ScanProgress {
   $script:processedPortTests += $addedTests
   $rate = 0
   if ($sw.Elapsed.TotalSeconds -gt 0) { $rate = [int]($processedPortTests / $sw.Elapsed.TotalSeconds) }
-  if ($EstimateTotal -and $totalTestsEstimate -gt 0) {
+  if ($totalTestsEstimate -gt 0) {
     $pct    = [int](100 * $processedPortTests / $totalTestsEstimate)
+    if ($pct -gt 100) { $pct = 100 }
     $remain = $totalTestsEstimate - $processedPortTests
     $etaSec = if ($rate -gt 0) { [int]($remain / $rate) } else { 0 }
     $status = "Tested $processedPortTests/$totalTestsEstimate ports @ ~${rate}/s | ETA ~ ${etaSec}s"
@@ -320,15 +302,80 @@ function Update-ScanProgress {
   }
 }
 
-# ====== MAIN ======
-# Optional: estimate totals for percent/ETA
-if ($ShowProgress -and $EstimateTotal) {
+# ====== TOTALS ESTIMATION (always when ShowProgress) ======
+function Initialize-Totals {
+  if (-not $ShowProgress) { return }
   Write-Host "Estimating totals for progress..." -ForegroundColor Yellow
-  $totalIPsEstimate = 0
-  foreach ($__ip in (Get-InputIPsStream -IPsInput $IPs)) { $totalIPsEstimate++ }
-  $totalTestsEstimate = [int64]$totalIPsEstimate * [int64]$allPorts.Count
-  Write-Host "Estimated: $totalIPsEstimate IP(s), $totalTestsEstimate port test(s)" -ForegroundColor Yellow
+
+  # Bail out early if the input obviously contains massive CIDRs; show indeterminate progress later
+  $probablyHuge = $false
+  if (Test-Path -LiteralPath $IPs) {
+    # Quick peek at first few non-comment lines to detect /0-/7
+    $peek = Get-Content -LiteralPath $IPs -TotalCount 200
+    foreach ($ln in $peek) {
+      if ([string]::IsNullOrWhiteSpace($ln)) { continue }
+      $t = $ln.Trim()
+      if ($t.StartsWith('#')) { continue }
+      foreach ($seg in $t.Split(',')) {
+        $s = $seg.Trim()
+        if ($s -match '\/(\d+)$') {
+          $px = [int]$Matches[1]
+          if ($px -lt 8) { $probablyHuge = $true; break }
+        }
+      }
+      if ($probablyHuge) { break }
+    }
+  } else {
+    foreach ($seg in $IPs.Split(',')) {
+      $s = $seg.Trim()
+      if ($s -match '\/(\d+)$') {
+        $px = [int]$Matches[1]
+        if ($px -lt 8) { $probablyHuge = $true; break }
+      }
+    }
+  }
+
+  if ($probablyHuge) {
+    Write-Warning "Very large CIDR(s) detected (/<8). Percent progress disabled; showing indeterminate bars."
+    $script:totalIPsEstimate = 0
+    $script:totalTestsEstimate = 0
+    return
+  }
+
+  # Streaming count with live indicator (updates every 50k)
+  $count = 0; $batch = 0
+  foreach ($__ip in (Get-InputIPsStream -IPsInput $IPs)) {
+    $count++; $batch++
+    if ($batch -ge 50000) {
+      $rate = 0
+      if ($sw.Elapsed.TotalSeconds -gt 0) { $rate = [int]($count / $sw.Elapsed.TotalSeconds) }
+      Write-Progress -Id $progressIdEstimate -Activity "Estimating IP count" -Status "$count counted @ ~${rate}/s" -PercentComplete -1
+      $batch = 0
+      # Soft safety cap to avoid accidental /0 enumeration
+      if ($count -ge 20000000) {
+        Write-Warning "Reached 20,000,000 IPs during estimation; switching to indeterminate progress."
+        $probablyHuge = $true
+        break
+      }
+    }
+  }
+  Write-Progress -Id $progressIdEstimate -Activity "Estimating IP count" -Completed
+
+  if ($probablyHuge) {
+    $script:totalIPsEstimate   = 0
+    $script:totalTestsEstimate = 0
+  } else {
+    $script:totalIPsEstimate   = [int64]$count
+    $script:totalTestsEstimate = [int64]$count * [int64]$allPorts.Count
+    Write-Host "Estimated: $totalIPsEstimate IP(s), $totalTestsEstimate port test(s)" -ForegroundColor Yellow
+  }
 }
+
+# ===== Epoch helper (host local time -> epoch seconds) =====
+function Get-LocalEpoch { [int64][System.DateTimeOffset]::Now.ToUnixTimeSeconds() }
+
+# ====== MAIN ======
+if ($ShowProgress) { Initialize-Totals }
 
 Write-Host "Expanding IP list (streaming + dedupe)..." -ForegroundColor Cyan
 $ipStream = Get-InputIPsStream -IPsInput $IPs
@@ -372,7 +419,7 @@ if ($Ping) {
       $chunk.Clear()
     }
   }
-  # process tail
+  # tail
   if ($chunk.Count -gt 0) {
     if ($psMajor -ge 7) {
       $PingRecords += $chunk | ForEach-Object -Parallel {
@@ -405,14 +452,10 @@ if ($Ping) {
     $chunk.Clear()
   }
 
-  # Console: ONLY successes
   foreach ($rec in $PingRecords | Where-Object { $_.Status -eq 'SUCCESS' }) {
     Write-Host " [OK]  $($rec.Host)" -ForegroundColor Green
   }
-
   if ($ShowProgress) { Write-Progress -Id $progressIdPing -Activity "Pinging hosts" -Completed }
-
-  # Reset the stream for scans (re-enumerate the input)
   $ipStream = Get-InputIPsStream -IPsInput $IPs
 } else {
   Write-Host "Skipping ping; proceeding directly to port scans." -ForegroundColor Yellow
@@ -427,6 +470,7 @@ foreach ($ip in $ipStream) {
   $null = $chunk2.Add($ip)
   if ($chunk2.Count -ge $ChunkSize) {
     if ($psMajor -ge 7) {
+      # PS7+: print OPEN immediately inside parallel block if -Interactive
       $PortRecords += $chunk2 | ForEach-Object -Parallel {
         param($ports,$timeout)
         $ipAddr = $_
@@ -436,11 +480,13 @@ foreach ($ip in $ipStream) {
           $ok = $c.ConnectAsync($ipAddr,$port).Wait($timeout)
           $status = if ($ok) { 'OPEN' } else { 'CLOSED' }
           $ts = [System.DateTimeOffset]::Now.ToUnixTimeSeconds()
+          if ($using:Interactive -and $ok) { Write-Host ("  [OPEN] {0}:{1}" -f $ipAddr,$port) -ForegroundColor Green }
           $c.Dispose()
           [PSCustomObject]@{ Type='Port'; Host=$ipAddr; Port=$port; Status=$status; Timestamp=$ts }
         }
       } -ArgumentList ($allPorts,$TimeoutMs) -ThrottleLimit $ThrottleLimit
     } else {
+      # PS5.1: runspace pool; process async as they complete (interactive prints on completion)
       $pool = [runspacefactory]::CreateRunspacePool(1,$ThrottleLimit); $pool.Open()
       $jobs = @()
       foreach ($ipAddr in $chunk2) {
@@ -459,7 +505,23 @@ foreach ($ip in $ipStream) {
           $jobs += @{ PS = $ps; Async = $ps.BeginInvoke() }
         }
       }
-      foreach ($j in $jobs) { $PortRecords += $j.PS.EndInvoke($j.Async); $j.PS.Dispose() }
+      $pending = New-Object System.Collections.ArrayList
+      [void]$pending.AddRange($jobs)
+      while ($pending.Count -gt 0) {
+        for ($i = $pending.Count - 1; $i -ge 0; $i--) {
+          $j = $pending[$i]
+          if ($j.Async.IsCompleted) {
+            $res = $j.PS.EndInvoke($j.Async)
+            $j.PS.Dispose()
+            [void]$pending.RemoveAt($i)
+            $PortRecords += $res
+            if ($Interactive -and $res.Status -eq 'OPEN') {
+              Write-Host ("  [OPEN] {0}:{1}" -f $res.Host,$res.Port) -ForegroundColor Green
+            }
+          }
+        }
+        if ($pending.Count -gt 0) { Start-Sleep -Milliseconds 10 }
+      }
       $pool.Close()
     }
     Update-ScanProgress -AddedHosts $chunk2.Count
@@ -479,6 +541,7 @@ if ($chunk2.Count -gt 0) {
         $ok = $c.ConnectAsync($ipAddr,$port).Wait($timeout)
         $status = if ($ok) { 'OPEN' } else { 'CLOSED' }
         $ts = [System.DateTimeOffset]::Now.ToUnixTimeSeconds()
+        if ($using:Interactive -and $ok) { Write-Host ("  [OPEN] {0}:{1}" -f $ipAddr,$port) -ForegroundColor Green }
         $c.Dispose()
         [PSCustomObject]@{ Type='Port'; Host=$ipAddr; Port=$port; Status=$status; Timestamp=$ts }
       }
@@ -502,7 +565,23 @@ if ($chunk2.Count -gt 0) {
         $jobs += @{ PS = $ps; Async = $ps.BeginInvoke() }
       }
     }
-    foreach ($j in $jobs) { $PortRecords += $j.PS.EndInvoke($j.Async); $j.PS.Dispose() }
+    $pending = New-Object System.Collections.ArrayList
+    [void]$pending.AddRange($jobs)
+    while ($pending.Count -gt 0) {
+      for ($i = $pending.Count - 1; $i -ge 0; $i--) {
+        $j = $pending[$i]
+        if ($j.Async.IsCompleted) {
+          $res = $j.PS.EndInvoke($j.Async)
+          $j.PS.Dispose()
+          [void]$pending.RemoveAt($i)
+          $PortRecords += $res
+          if ($Interactive -and $res.Status -eq 'OPEN') {
+            Write-Host ("  [OPEN] {0}:{1}" -f $res.Host,$res.Port) -ForegroundColor Green
+          }
+        }
+      }
+      if ($pending.Count -gt 0) { Start-Sleep -Milliseconds 10 }
+    }
     $pool.Close()
   }
   Update-ScanProgress -AddedHosts $chunk2.Count
@@ -511,17 +590,19 @@ if ($chunk2.Count -gt 0) {
 
 if ($ShowProgress) { Write-Progress -Id $progressIdScan -Activity "Scanning TCP ports" -Completed }
 
-# ----- Console output: ONLY successes -----
-$PortRecords | Where-Object { $_.Status -eq 'OPEN' } | Group-Object Host | ForEach-Object {
-  $name = $_.Name
-  $opens = $_.Group | Where-Object { $_.Status -eq 'OPEN' }
-  if ($opens.Count -gt 0) {
-    Write-Host "`n=== Results for $name ===" -ForegroundColor Yellow
-    foreach ($rec in $opens) { Write-Host "  [OPEN] $($name):$($rec.Port)" -ForegroundColor Green }
-  }
-}
-if ($Ping) {
-  foreach ($rec in $PingRecords | Where-Object { $_.Status -eq 'SUCCESS' }) { break }
+# ----- Optional grouped summary (suppressed for -Interactive) -----
+if ($Summary -and -not $Interactive) {
+  $PortRecords | Where-Object { $_.Status -eq 'OPEN' } |
+    Group-Object Host | ForEach-Object {
+      $name  = $_.Name
+      $opens = $_.Group | Where-Object { $_.Status -eq 'OPEN' }
+      if ($opens.Count -gt 0) {
+        Write-Host "`n=== Results for $name ===" -ForegroundColor Yellow
+        foreach ($rec in $opens) {
+          Write-Host "  [OPEN] $($name):$($rec.Port)" -ForegroundColor Green
+        }
+      }
+    }
 }
 
 # ----- Export -----
@@ -537,5 +618,8 @@ if ($finalPath) {
   $fmt = if ($Json) { 'JSON' } else { 'CSV' }
   Write-Host "No output file specified. (Format preference: $fmt)" -ForegroundColor Yellow
 }
+
+# Restore original ProgressPreference
+if ($ShowProgress) { $ProgressPreference = $__prevProgressPreference }
 
 Write-Host "`nScan complete." -ForegroundColor Cyan
