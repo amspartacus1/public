@@ -834,7 +834,7 @@ def cli():
     ap.add_argument("--list-common-dkim", action="store_true",
                     help="Print the curated common DKIM selector list and exit.")
 
-    # Live DKIM discovery prints + progress
+    # LIVE prints + progress
     ap.add_argument("--no-live-dkim-prints", action="store_true",
                     help="Disable live STDOUT prints for each discovered DKIM selector.")
     ap.add_argument("--progress", action="store_true",
@@ -857,15 +857,44 @@ def cli():
             print(sel)
         sys.exit(0)
 
-    # Domains
-    domains: List[str] = []
-    if args.domains: domains.extend(args.domains)
-    if args.domains_file: domains.extend(read_domains_from_file(args.domains_file))
-    domains = [d for d in [normalize_domain(d) for d in domains] if d]
-    if not domains:
-        print("No domains supplied. Provide one or more domains, or --domains-file."); sys.exit(2)
+    # --- Load zone first (if provided) ---
+    zone_backend: Optional[ZoneDNS] = None
+    offline = False
+    if args.zone_file:
+        try:
+            if args.zone_origin:
+                origin = dns.name.from_text(args.zone_origin)
+                z = dns.zone.from_file(args.zone_file, origin=origin, relativize=False)
+            else:
+                z = dns.zone.from_file(args.zone_file, relativize=False)
+            zone_backend = ZoneDNS(z)
+            backend: DNSBackend = zone_backend
+            offline = True
+        except Exception as e:
+            print(f"ERROR: Failed to load zone file: {e}")
+            sys.exit(2)
+    else:
+        backend = LiveDNS(args.timeout)
 
-    # Build selector list (CLI ∪ file ∪ (optional) common), dedup preserve order
+    # --- Build domain list ---
+    domains: List[str] = []
+    if args.domains:
+        domains.extend(args.domains)
+    if args.domains_file:
+        domains.extend(read_domains_from_file(args.domains_file))
+
+    # If still empty and we have a zone, default to the zone apex (origin)
+    if not domains and zone_backend is not None:
+        domains = [zone_backend.origin.to_text().rstrip('.')]
+
+    domains = [d for d in [normalize_domain(d) for d in domains] if d]
+
+    # Only error if we have neither domains nor a zone file
+    if not domains:
+        print("No domains supplied. Provide one or more domains, --domains-file, or --zone-file.")
+        sys.exit(2)
+
+    # --- Build selector list (CLI ∪ file ∪ optional common), dedupe preserve order ---
     selectors_source: List[str] = []
     selectors_source.extend(args.dkim_selector or [])
     if args.dkim_selectors_file:
@@ -878,31 +907,9 @@ def cli():
         selectors_source.extend(COMMON_DKIM_SELECTORS)
     selectors_final: List[str] = dedupe_preserve_order([s.strip() for s in selectors_source if s and s.strip()])
 
-    # Choose backend
-    zone_backend: Optional[ZoneDNS] = None
-    offline = False
-    if args.zone_file:
-        # Parse zone
-        try:
-            if args.zone_origin:
-                origin = dns.name.from_text(args.zone_origin)
-                z = dns.zone.from_file(args.zone_file, origin=origin, relativize=False)
-            else:
-                # Try without origin (zone file should contain $ORIGIN or absolute names)
-                z = dns.zone.from_file(args.zone_file, relativize=False)
-            zone_backend = ZoneDNS(z)
-            backend: DNSBackend = zone_backend
-            offline = True
-        except Exception as e:
-            print(f"ERROR: Failed to load zone file: {e}")
-            sys.exit(2)
-    else:
-        backend = LiveDNS(args.timeout)
-
-    # Live prints toggle (default ON)
     live_dkim_prints = (not args.no_live_dkim_prints)
 
-    # Run checks
+    # --- Run checks ---
     all_results: List[CheckResult] = []
     for d in domains:
         all_results.extend(
@@ -920,10 +927,8 @@ def cli():
             )
         )
 
-    # Human table
     print_table(all_results, quiet=args.quiet)
 
-    # Optional machine outputs
     if args.json:
         payload = [
             {
