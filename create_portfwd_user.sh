@@ -12,7 +12,7 @@
 #   sudo ./create_portfwd_user.sh -u USERNAME -k /path/to/publickey.pub
 #   sudo ./create_portfwd_user.sh -u USERNAME -K "ssh-ed25519 AAAA... comment"
 #
-# Creator: amspartacus1                               Last Updated: 01-05-2025
+# Creator: amspartacus1                               Last Updated: 10-29-2026
 ##############################################################################
 
 set -euo pipefail
